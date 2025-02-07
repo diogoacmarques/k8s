@@ -139,7 +139,7 @@
     - name: Restart and enable Containerd
       systemd:
         name: containerd
-        state: started
+        state: restarted
         enabled: yes
 
     - name: Get the latest Kubernetes release version from GitHub
@@ -163,7 +163,6 @@
 
     - name: Add Kubernetes GPG key
       shell: curl -fsSL "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
-      register: testing_output
 
     - name: Download the Kubernetes Release.key
       ansible.builtin.get_url:
@@ -173,20 +172,32 @@
     - name: Convert the key to keyring format
       ansible.builtin.command:
         cmd: "gpg --dearmor /tmp/Release.key"
-        creates: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+        creates: "/tmp/Release.key.gpg"
         chdir: /tmp
 
-    #- name: Move the converted key to the correct location
-    #  ansible.builtin.copy:
-    #    src: "/tmp/Release.key.gpg"
-    #    dest: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
-    #    remote_src: yes
+    - name: Move the converted key to the correct location
+      ansible.builtin.copy:
+        src: "/tmp/Release.key.gpg"
+        dest: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+        remote_src: yes
+
+    - name: Remove Release.key (delete file)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - /tmp/Release.key
+        - /tmp/Release.key.gpg
 
     - name: Add Kubernetes repository
       copy:
         dest: /etc/apt/sources.list.d/kubernetes.list
         content: |
           deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
+
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
 
     - name: Install kubelet, kubeadm, and kubectl
       apt:
