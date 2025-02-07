@@ -1,0 +1,109 @@
+#ansible-playbook -i 192.168.1.100, 00-k8s-setup.yaml -K
+---
+- name: K8s Vanilla - Init Cluster 
+  hosts: all
+  become: true
+  #gather_facts: false
+  tasks:
+    - name: Get the latest Kubernetes release version from GitHub
+      uri:
+        url: "https://api.github.com/repos/kubernetes/kubernetes/releases/latest"
+        method: GET
+        return_content: yes
+        headers:
+          Accept: "application/vnd.github.v3+json"
+      register: release_info
+
+    - name: Extract latest Kubernetes version
+      set_fact:
+        kubernetes_version: "{{ release_info.json.tag_name[1:5] }}"
+
+    - debug:
+        msg: " {{ kubernetes_version }} "
+
+    - name: Init Cluster 
+      shell: "kubeadm init --pod-network-cidr=10.244.0.0/16 --upload-certs --kubernetes-version=stable-{{ kubernetes_version }} --cri-socket unix:///var/run/containerd/containerd.sock"
+
+    - name: Create .kube directory
+      file:
+        path: "{{ item.dir }}/.kube" 
+        owner: "{{ item.user  }}"
+        group: "{{ item.user  }}"
+        state: directory
+      loop: 
+        - user: root
+          dir: /root
+
+    - name: Copy config to .kube folder
+      copy: 
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ item }}/.kube/config"
+        remote_src: yes
+      loop: 
+        - /root
+
+    - name: Set permissions for .kube folder
+      file:
+        path: "{{ item.dir }}/.kube/config"
+        owner: "{{ item.user  }}"
+        group: "{{ item.user  }}"
+      loop:
+        - user: root
+          dir: /root
+
+    - name: Untaint Nodes
+      shell: |
+        kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+    #    kubectl taint nodes --all node-role.kubernetes.io/master-
+    #    kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+    #    kubectl label node {{ inventory_hostname }} node-role.kubernetes.io/worker=worker
+    #    kubectl label node {{ inventory_hostname }} node-role.kubernetes.io/etcd=etcd
+
+    - name: Install Calico
+      shell: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/calico.yaml
+
+    - name: Wait for Calico Installation
+      pause: 
+        minutes: 1 
+
+    - name: Validate if calico is up and running
+      shell: kubectl get pods --all-namespaces | awk '{print $4}'
+      register: calico_output
+      retries: 24
+      delay: 10
+      until: calico_output.stdout_lines[1:] | reject('in', ['Running', 'Completed']) | list | length == 0
+
+    - name: Install Nginx Ingress
+      shell: kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/baremetal/deploy.yaml
+
+    - name: Wait for Nginx Ingress Installation
+      pause: 
+        minutes: 1 
+
+    - name: Validate if nginx ingress is up and running
+      shell: kubectl get pods -n ingress-nginx | awk '{print $3}'
+      register: nginx_ingress_output
+      retries: 24
+      delay: 10
+      until: nginx_ingress_output.stdout_lines[1:] | reject('in', ['Running', 'Completed']) | list | length == 0
+
+    - name: Install MetalLB
+      shell: kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+
+    - name: Wait for MetalLB Installation
+      pause: 
+        minutes: 1 
+
+    - name: Validate if MetalLB is up and running
+      shell: kubectl get pods -n metallb-system | awk '{print $3}'
+      register: metallb_output
+      retries: 24
+      delay: 10
+      until: metallb_output.stdout_lines[1:] | reject('in', ['Running', 'Completed']) | list | length == 0
+
+    - name: Get join command
+      shell: kubeadm token create --print-join-command
+      register: join_command
+
+    - name: Reboot host
+      reboot:
