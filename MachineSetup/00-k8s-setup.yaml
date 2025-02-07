@@ -1,0 +1,206 @@
+#ansible-playbook -i 192.168.1.100, 00-k8s-setup.yaml --user ubuntu --private-key ~/.ssh/id_rsa
+---
+- name: Install Kubernetes master node with Calico network
+  hosts: control-planes
+  become: true
+  #gather_facts: false
+  tasks:
+    - name: Disable interactive mode for sysctl
+      lineinfile:
+        path: /etc/needrestart/needrestart.conf
+        regexp: "#\\$nrconf\\{restart\\} = 'i';"
+        line: "\\$nrconf{restart} = 'a';"
+
+    - name: Update and upgrade Ubuntu packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    #- name: Get the IP address
+    #  shell: ip a | awk '/inet/ {print $2}' | cut -d/ -f1
+    #  register: ip_address
+#
+    #- name: Get the hostname
+    #  command: hostname
+    #  register: hostname_output
+#
+    #- name: Add IP address and hostname to /etc/hosts if it doesn't exist
+    #  lineinfile:
+    #    path: /etc/hosts
+    #    line: "{{ ip_address.stdout }} {{ hostname_output.stdout }}"
+    #    state: present
+    #    create: yes
+    #    insertafter: EOF
+    #    regexp: '^{{ ip_address.stdout }}\s+{{ hostname_output.stdout }}$'
+
+    - name: Disable memory swap
+      shell: |
+        sed -i '/swap/ s/^\(.*\)$/# \1/g' /etc/fstab
+        swapoff -a
+
+    - name: Add kernel modules for Containerd
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        content: |
+          overlay
+          br_netfilter
+    
+    - name: Load kernel modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Add kernel parameters for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Reload sysctl configuration
+      command: sysctl --system
+
+    - name: Install gnupg2 for Containerd
+      apt:
+        name: gnupg2
+        state: present
+
+    - name: Create directory for keyrings
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Check if /etc/apt/keyrings/docker.asc exists
+      stat:
+        path: /etc/apt/keyrings/docker.asc
+      register: stat_result
+
+    - name: Update CA certificates
+      ansible.builtin.command:
+        cmd: update-ca-certificates --fresh
+      become: yes
+
+    - name: Set SSL_CERT_DIR environment variable
+      ansible.builtin.shell: echo "export SSL_CERT_DIR=/etc/ssl/certs" >> /etc/environment
+      become: yes
+
+    - name: Download Docker's GPG key
+      when: not stat_result.stat.exists
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+        validate_certs: false
+
+    - name: Set permissions for the GPG key
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+    
+    - name: Get Architecture
+      command: dpkg --print-architecture
+      register: architecture
+
+    - name: Add Docker repository
+      copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        content: |
+          deb [arch={{ architecture.stdout }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+
+    - name: Remove incompatible Docker-related packages
+      apt:
+        name: 
+          - docker.io
+          - docker-doc
+          - docker-compose
+          - docker-compose-v2
+          - podman-docker
+          - containerd
+          - runc
+        state: absent
+        purge: yes
+
+    - name: Install Containerd from Docker repository
+      apt:
+        name: containerd.io
+        state: present
+
+    - name: Configure Containerd for systemd
+      shell: |
+        containerd config default | tee /etc/containerd/config.toml
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+
+    - name: Restart and enable Containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Get the latest Kubernetes release version from GitHub
+      uri:
+        url: "https://api.github.com/repos/kubernetes/kubernetes/releases/latest"
+        method: GET
+        return_content: yes
+        headers:
+          Accept: "application/vnd.github.v3+json"
+      register: release_info
+
+    - name: Extract latest Kubernetes version
+      set_fact:
+        kubernetes_version: "{{ release_info.json.tag_name[1:5] }}"
+
+    - name: Create a directory if it does not exist
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0655'
+
+    - name: Add Kubernetes GPG key
+      shell: curl -fsSL "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+      register: testing_output
+
+    - name: Download the Kubernetes Release.key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+        dest: "/tmp/Release.key"
+
+    - name: Convert the key to keyring format
+      ansible.builtin.command:
+        cmd: "gpg --dearmor /tmp/Release.key"
+        creates: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+        chdir: /tmp
+
+    - name: Move the converted key to the correct location
+      ansible.builtin.copy:
+        src: "/tmp/Release.key.gpg"
+        dest: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+        remote_src: yes
+
+    - name: Add Kubernetes repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
+
+    - name: Install kubelet, kubeadm, and kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    #- name: Install kubelet, kubeadm, and kubectl
+    #  apt:
+    #    name:
+    #      - kubelet
+    #      - kubeadm
+    #      - kubectl
+    #    state: held #Held is not an option
+ 
