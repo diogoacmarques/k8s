@@ -1,7 +1,7 @@
-#ansible-playbook -i 192.168.1.100, 00-k8s-setup.yaml --user ubuntu --private-key ~/.ssh/id_rsa
+#ansible-playbook -i 192.168.1.100, 00-k8s-setup.yaml -K
 ---
-- name: Install Kubernetes master node with Calico network
-  hosts: control-planes
+- name: Install Kubernetes on node
+  hosts: all
   become: true
   #gather_facts: false
   tasks:
@@ -176,11 +176,11 @@
         creates: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
         chdir: /tmp
 
-    - name: Move the converted key to the correct location
-      ansible.builtin.copy:
-        src: "/tmp/Release.key.gpg"
-        dest: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
-        remote_src: yes
+    #- name: Move the converted key to the correct location
+    #  ansible.builtin.copy:
+    #    src: "/tmp/Release.key.gpg"
+    #    dest: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+    #    remote_src: yes
 
     - name: Add Kubernetes repository
       copy:
